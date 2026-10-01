@@ -251,6 +251,24 @@ function releaseAssignmentsOfMatch(m, why, operator = '系统') {
   })
 }
 
+/* ================= 循环赛对阵生成（种子与报名重排共用） ================= */
+// 时间槽：09:00 起、每场间隔 20 分钟，按 order_no 顺排，保证任意队数下时段不重复
+function rrSlotLabel(i) {
+  const mins = 9 * 60 + i * 20
+  return `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`
+}
+// 生成单循环对阵并初始化时间/场地（venueId 为空时退化为未指定场地）
+function createRoundRobinMatches(sportId, teamIds, venueId) {
+  const pairList = arr => { const p = []; for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) p.push([arr[i], arr[j]]); return p }
+  const ids = []
+  pairList(teamIds).forEach(([a, b], i) => {
+    const r = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)',
+      sportId, '循环', a, b, venueId ?? null, i + 1, rrSlotLabel(i), 'scheduled')
+    ids.push(Number(r.lastInsertRowid))
+  })
+  return ids
+}
+
 /* ================= 种子数据 ================= */
 function seed() {
   if (get('SELECT COUNT(*) c FROM sports').c > 0) return
@@ -303,20 +321,14 @@ function seed() {
   // 循环赛助手
   const pairs = arr => { const p = []; for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) p.push([arr[i], arr[j]]); return p }
 
-  const venueById = vid('中心篮球馆')
-
-  // —— 篮球：4队 单循环 6 场
-  let ono = 0
-  pairs(B).forEach(([a, b]) => {
-    ono++
-    run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)', spBasket, '循环', a, b, venueById, ono, ['09:00', '09:20', '09:40', '10:00', '10:20', '10:40'][(ono - 1) % 6], 'scheduled')
-  })
+  // —— 篮球：4队 单循环 6 场（09:00 起 20 分钟间隔 @中心篮球馆）
+  createRoundRobinMatches(spBasket, B, vid('中心篮球馆'))
 
   // —— 足球：分 AB 两组（A: 雷霆/雄狮/闪电  B: 飞鹰/星河/烈焰），组内循环 6 场；两组时段错开避免同场撞档 ——
   const grpA = [F[0], F[2], F[4]]
   const grpB = [F[1], F[3], F[5]]
   const footIds = { A: [], B: [] }
-  ono = 0
+  let ono = 0
   pairs(grpA).forEach(([a, b]) => { ono++; const r = run('INSERT INTO matches (sport_id,stage,group_name,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?,?)', spFoot, '小组', 'A组', a, b, vid('五人足球场'), ono, slotsA[(ono - 1) % 3], 'scheduled'); footIds.A.push(Number(r.lastInsertRowid)) })
   pairs(grpB).forEach(([a, b]) => { ono++; const r = run('INSERT INTO matches (sport_id,stage,group_name,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?,?)', spFoot, '小组', 'B组', a, b, vid('五人足球场'), ono, slotsB[(ono - 1) % 3], 'scheduled'); footIds.B.push(Number(r.lastInsertRowid)) })
 
@@ -613,11 +625,11 @@ function approveRegistration(regId, reviewer) {
       old.forEach(m => releaseAssignmentsOfMatch(m, '报名通过触发循环赛程重排', reviewer || '系统'))
       run(`DELETE FROM matches WHERE sport_id=?`, reg.sport_id)
       const teams = all(`SELECT id FROM teams WHERE sport_id=? AND status='approved'`, reg.sport_id).map(t => t.id)
-      const pairList = arr => { const p = []; for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) p.push([arr[i], arr[j]]); return p }
-      let ono = 0
-      const newIds = []
-      pairList(teams).forEach(([a, b]) => { ono++; const r = run('INSERT INTO matches (sport_id,stage,team_a,team_b,order_no,status) VALUES (?,?,?,?,?,?)', reg.sport_id, '循环', a, b, ono, 'scheduled'); newIds.push(Number(r.lastInsertRowid)) })
-      addLog('schedule_rebuild', null, null, `${spo.name} 循环赛程因新增通过队伍「${reg.name}」重排，共 ${newIds.length} 场（执法安排需重新排班）`, null, reviewer || '系统')
+      // 重建对阵：与种子同一口径初始化时间槽与项目默认场地，避免重排后时间/场地丢失
+      const newIds = createRoundRobinMatches(reg.sport_id, teams, vid(spo.venue))
+      addLog('schedule_rebuild', null, null, `${spo.name} 循环赛程因新增通过队伍「${reg.name}」重排，共 ${newIds.length} 场（时间/场地已初始化，执法安排联动重排）`, null, reviewer || '系统')
+      // 裁判安排联动：为重排后的新场次自动安排主裁（无可用裁判的留待排班页处理）
+      autoChiefForNewMatches(newIds, reviewer || '系统')
     }
   } else {
     run(`UPDATE athletes SET status='approved' WHERE id=?`, reg.athlete_id)
