@@ -489,17 +489,54 @@ function finishMatch(id, sa, sb, tbA = null, tbB = null) {
 
 // 新增场次后：尝试自动安排主裁（失败不阻断编排，供排班页处理）
 function autoChiefForNewMatches(matchIds, operator = '系统') {
+  const assigned = [], skipped = []
   matchIds.forEach(id => {
     const m = get('SELECT * FROM matches WHERE id=?', id)
-    if (!m || !m.time_label) return
+    if (!m) return
+    if (!m.time_label) { skipped.push({ match_id: m.id, title: matchTitle(m), reason: '未排定开赛时间' }); return }
     const has = get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, id)
     if (has) return
     const pick = pickChiefFor(m)
-    if (pick) {
-      run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,'chief','assigned')`, id, pick.id)
-      addLog('auto_assign', id, pick.id, `${matchTitle(m)} → ${pick.name} 随赛程生成自动排班为主裁`, '赛程新增联动', operator)
+    if (!pick) {
+      skipped.push({ match_id: m.id, title: matchTitle(m), reason: '该时段无可用（专长匹配且无冲突）裁判' })
+      return
     }
+    run(`INSERT INTO assignments (match_id,referee_id,role,status) VALUES (?,?,'chief','assigned')`, id, pick.id)
+    addLog('auto_assign', id, pick.id, `${matchTitle(m)} → ${pick.name} 随赛程生成自动排班为主裁`, '赛程新增联动', operator)
+    assigned.push({ match_id: m.id, title: matchTitle(m), referee: pick.name })
   })
+  return { assigned, skipped }
+}
+
+// 循环赛重排的场次初始化：保留仍存在对阵的时间/场地，新对阵补齐不撞场的默认时段
+function initRoundRobinSchedule(sportId, oldMatches) {
+  const spo = get('SELECT * FROM sports WHERE id=?', sportId)
+  const defaultVenueId = vid(spo.venue)
+  const oldByPair = new Map()
+  oldMatches.forEach(m => {
+    if (!m.team_a || !m.team_b) return
+    oldByPair.set(`${Math.min(m.team_a, m.team_b)}-${Math.max(m.team_a, m.team_b)}`, m)
+  })
+  const taken = new Set(all(`SELECT venue_id, time_label FROM matches
+                            WHERE status='scheduled' AND venue_id IS NOT NULL AND time_label IS NOT NULL`)
+    .map(m => `${m.venue_id}:${m.time_label}`))
+  const makeTime = index => {
+    const total = index * 20
+    return `${String(9 + Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`
+  }
+  let timeIndex = 0
+  const nextSlot = venueId => {
+    let label = makeTime(timeIndex++)
+    while (venueId && taken.has(`${venueId}:${label}`)) label = makeTime(timeIndex++)
+    if (venueId) taken.add(`${venueId}:${label}`)
+    return label
+  }
+  return ([a, b], orderNo) => {
+    const old = oldByPair.get(`${Math.min(a, b)}-${Math.max(a, b)}`)
+    const venueId = old?.venue_id || defaultVenueId
+    const timeLabel = old?.time_label || nextSlot(venueId)
+    return { venueId, timeLabel }
+  }
 }
 
 function generateKO(sportId) {
@@ -612,12 +649,23 @@ function approveRegistration(regId, reviewer) {
       const old = all(`SELECT * FROM matches WHERE sport_id=?`, reg.sport_id)
       old.forEach(m => releaseAssignmentsOfMatch(m, '报名通过触发循环赛程重排', reviewer || '系统'))
       run(`DELETE FROM matches WHERE sport_id=?`, reg.sport_id)
-      const teams = all(`SELECT id FROM teams WHERE sport_id=? AND status='approved'`, reg.sport_id).map(t => t.id)
+      const teams = all(`SELECT id FROM teams WHERE sport_id=? AND status='approved' ORDER BY id`, reg.sport_id).map(t => t.id)
       const pairList = arr => { const p = []; for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) p.push([arr[i], arr[j]]); return p }
+      const scheduleFor = initRoundRobinSchedule(reg.sport_id, old)
       let ono = 0
       const newIds = []
-      pairList(teams).forEach(([a, b]) => { ono++; const r = run('INSERT INTO matches (sport_id,stage,team_a,team_b,order_no,status) VALUES (?,?,?,?,?,?)', reg.sport_id, '循环', a, b, ono, 'scheduled'); newIds.push(Number(r.lastInsertRowid)) })
-      addLog('schedule_rebuild', null, null, `${spo.name} 循环赛程因新增通过队伍「${reg.name}」重排，共 ${newIds.length} 场（执法安排需重新排班）`, null, reviewer || '系统')
+      pairList(teams).forEach(([a, b]) => {
+        ono++
+        const { venueId, timeLabel } = scheduleFor([a, b], ono)
+        const r = run('INSERT INTO matches (sport_id,stage,team_a,team_b,venue_id,order_no,time_label,status) VALUES (?,?,?,?,?,?,?,?)',
+          reg.sport_id, '循环', a, b, venueId, ono, timeLabel, 'scheduled')
+        newIds.push(Number(r.lastInsertRowid))
+      })
+      const chiefResult = autoChiefForNewMatches(newIds, reviewer || '系统')
+      const skipText = chiefResult.skipped.length ? `；${chiefResult.skipped.length} 场待排班` : ''
+      addLog('schedule_rebuild', null, null,
+        `${spo.name} 循环赛程因新增通过队伍「${reg.name}」重排，共 ${newIds.length} 场；时间、场地已初始化，自动安排主裁 ${chiefResult.assigned.length} 场${skipText}`,
+        null, reviewer || '系统')
     }
   } else {
     run(`UPDATE athletes SET status='approved' WHERE id=?`, reg.athlete_id)
